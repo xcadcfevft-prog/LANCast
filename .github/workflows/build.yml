@@ -1,0 +1,48 @@
+name: Build LANCast
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unzip
+        shell: pwsh
+        run: Expand-Archive -Path LANCast_project.zip -DestinationPath .
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build exe
+        working-directory: LANCast/windows
+        run: |
+          npm install
+          npm run dist
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LANCast-windows-exe
+          path: LANCast/windows/dist/*.exe
+
+  android-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unzip
+        run: unzip -q LANCast_project.zip
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Build debug APK
+        working-directory: LANCast/android
+        run: gradle assembleDebug --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LANCast-android-apk
+          path: LANCast/android/app/build/outputs/apk/debug/*.apk
