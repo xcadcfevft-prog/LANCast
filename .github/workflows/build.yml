@@ -10,7 +10,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Unzip
         shell: pwsh
-        run: Expand-Archive -Path LANCast_project.zip -DestinationPath .
+        run: Expand-Archive -Path "LANCast_project(1).zip" -DestinationPath .
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Unzip
-        run: unzip -q LANCast_project.zip
+        run: unzip -q "LANCast_project(1).zip"
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
