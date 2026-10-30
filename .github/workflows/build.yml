@@ -1,48 +1,123 @@
-name: Build LANCast
+name: Build
+
 on:
   push:
   workflow_dispatch:
 
 jobs:
-  windows-exe:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Unzip
-        shell: pwsh
-        run: Expand-Archive -Path "LANCast_project(1).zip" -DestinationPath .
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - name: Build exe
-        working-directory: LANCast/windows
-        run: |
-          npm install
-          npm run dist
-        env:
-          CSC_IDENTITY_AUTO_DISCOVERY: "false"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: LANCast-windows-exe
-          path: LANCast/windows/dist/*.exe
-
   android-apk:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Unzip
-        run: unzip -q "LANCast_project(1).zip"
+        with:
+          fetch-depth: 0
+
+      # 如果仓库根目录里有项目 zip，就取“最近提交”的那个，解压到临时目录后覆盖进工作区。
+      # 不再直接 unzip 到当前目录（旧写法遇到同名文件会弹出覆盖询问，CI 里无法回答，直接失败）。
+      # 没有 zip 时，直接用仓库里已经解开的文件。
+      - name: Unpack newest project zip (if any)
+        shell: bash
+        run: |
+          newest=""; newest_t=0
+          shopt -s nullglob
+          for f in *.zip; do
+            t=$(git log -1 --format=%ct -- "$f" || echo 0)
+            echo "found: $f (committed at $t)"
+            if [ "$t" -ge "$newest_t" ]; then newest_t=$t; newest="$f"; fi
+          done
+          if [ -z "$newest" ]; then
+            echo "no zip found, using repository files as-is"
+          else
+            echo "USING: $newest"
+            tmp="$RUNNER_TEMP/proj"
+            rm -rf "$tmp"; mkdir -p "$tmp"
+            unzip -q -o "$newest" -d "$tmp"
+            # 兼容 zip 内有/没有顶层目录（如 LANCast/）
+            root="$tmp"
+            if [ ! -d "$root/android" ]; then
+              root=$(dirname "$(find "$tmp" -maxdepth 3 -type d -name android | head -n1)")
+            fi
+            echo "project root in zip: $root"
+            cp -a "$root"/. "$GITHUB_WORKSPACE"/
+          fi
+          ls -la
+          test -d android || { echo "::error::android/ directory not found"; exit 1; }
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
+
+      - name: Accept Android licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.7
+          gradle-version: "8.7"
+
       - name: Build debug APK
-        working-directory: LANCast/android
-        run: gradle assembleDebug --stacktrace
+        working-directory: android
+        run: gradle assembleDebug --no-daemon --stacktrace
+
       - uses: actions/upload-artifact@v4
         with:
-          name: LANCast-android-apk
-          path: LANCast/android/app/build/outputs/apk/debug/*.apk
+          name: LANCast-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Unpack newest project zip (if any)
+        shell: pwsh
+        run: |
+          $newest = $null; $newestT = 0
+          foreach ($f in Get-ChildItem -Path . -Filter *.zip -File) {
+            $t = [int64](git log -1 --format=%ct -- $f.Name)
+            Write-Host "found: $($f.Name) (committed at $t)"
+            if ($t -ge $newestT) { $newestT = $t; $newest = $f.FullName }
+          }
+          if (-not $newest) {
+            Write-Host "no zip found, using repository files as-is"
+          } else {
+            Write-Host "USING: $newest"
+            $tmp = Join-Path $env:RUNNER_TEMP "proj"
+            if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+            Expand-Archive -LiteralPath $newest -DestinationPath $tmp -Force
+            $root = $tmp
+            if (-not (Test-Path (Join-Path $root "windows"))) {
+              $hit = Get-ChildItem -Path $tmp -Directory -Recurse -Depth 2 -Filter windows | Select-Object -First 1
+              if ($hit) { $root = $hit.Parent.FullName }
+            }
+            Write-Host "project root in zip: $root"
+            Copy-Item -Path (Join-Path $root "*") -Destination $env:GITHUB_WORKSPACE -Recurse -Force
+          }
+          if (-not (Test-Path windows)) { Write-Error "windows/ directory not found"; exit 1 }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        working-directory: windows
+        run: npm install --no-audit --no-fund
+
+      - name: Run tests
+        working-directory: windows
+        run: npm test
+        continue-on-error: true
+
+      - name: Build exe (installer + portable)
+        working-directory: windows
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx electron-builder --win --publish never
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LANCast-windows-exe
+          path: |
+            windows/dist/*.exe
