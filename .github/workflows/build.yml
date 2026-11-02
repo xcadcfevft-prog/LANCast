@@ -4,44 +4,86 @@ on:
   push:
   workflow_dispatch:
 
+# 连续上传 / 连续推送时，只保留最新一次构建，旧的直接取消（省排队和运行时间）
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   android-apk:
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 如果仓库根目录里有项目 zip，就取“最近提交”的那个，解压到临时目录后覆盖进工作区。
-      # 不再直接 unzip 到当前目录（旧写法遇到同名文件会弹出覆盖询问，CI 里无法回答，直接失败）。
-      # 没有 zip 时，直接用仓库里已经解开的文件。
-      - name: Unpack newest project zip (if any)
-        shell: bash
+      # 取仓库里“最近提交”的项目 zip（文件名随便叫什么、放在哪个文件夹都行；里面没有 android/ 或 windows/ 的 zip 会被忽略），
+      # 解压后覆盖进工作区。没有 zip 时，直接用仓库里已经解开的文件。
+      - name: Unpack newest project zip (any file name)
+        shell: python3 {0}
+        env:
+          PYTHONUTF8: "1"
+          NEED_DIR: android
         run: |
-          newest=""; newest_t=0
-          shopt -s nullglob
-          for f in *.zip; do
-            t=$(git log -1 --format=%ct -- "$f" || echo 0)
-            echo "found: $f (committed at $t)"
-            if [ "$t" -ge "$newest_t" ]; then newest_t=$t; newest="$f"; fi
-          done
-          if [ -z "$newest" ]; then
-            echo "no zip found, using repository files as-is"
-          else
-            echo "USING: $newest"
-            tmp="$RUNNER_TEMP/proj"
-            rm -rf "$tmp"; mkdir -p "$tmp"
-            unzip -q -o "$newest" -d "$tmp"
-            # 兼容 zip 内有/没有顶层目录（如 LANCast/）
-            root="$tmp"
-            if [ ! -d "$root/android" ]; then
-              root=$(dirname "$(find "$tmp" -maxdepth 3 -type d -name android | head -n1)")
-            fi
-            echo "project root in zip: $root"
-            cp -a "$root"/. "$GITHUB_WORKSPACE"/
-          fi
-          ls -la
-          test -d android || { echo "::error::android/ directory not found"; exit 1; }
+          import os, shutil, subprocess, sys, tempfile, zipfile
+
+          def git(*a):
+              return subprocess.run(['git', '-c', 'core.quotepath=off', '--literal-pathspecs', *a],
+                                    capture_output=True, text=True, encoding='utf-8', errors='replace')
+
+          def is_project_dir(d):
+              return os.path.isdir(os.path.join(d, 'android')) or os.path.isdir(os.path.join(d, 'windows'))
+
+          # 1) 找出仓库里所有 .zip（任意文件名 / 任意子文件夹；跳过项目自己的目录），按“最近一次提交时间”从新到旧排
+          SKIP = {'.git', 'node_modules', 'android', 'windows', 'docs', 'assets', '.github'}
+          cands = []
+          for root, dirs, files in os.walk('.'):
+              dirs[:] = [d for d in dirs if d not in SKIP]
+              for f in files:
+                  if f.lower().endswith('.zip'):
+                      p = os.path.normpath(os.path.join(root, f)).replace('\\', '/')
+                      out = git('log', '-1', '--format=%ct', '--', p).stdout.strip()
+                      t = int(out) if out.isdigit() else 0
+                      print(f'found: {p} (committed at {t})')
+                      cands.append((t, os.path.getmtime(p), p))
+          cands.sort(reverse=True)
+
+          # 2) 取最新的、且里面确实有 android/ 或 windows/ 目录的那个（不是项目包的 zip 自动忽略）
+          chosen = None
+          for t, _, p in cands:
+              try:
+                  with zipfile.ZipFile(p) as z:
+                      names = ['/' + n.replace('\\', '/') for n in z.namelist()]
+                  if any('/android/' in n or '/windows/' in n for n in names):
+                      chosen = p; break
+                  print(f'skip (not a project zip): {p}')
+              except zipfile.BadZipFile:
+                  print(f'skip (bad zip): {p}')
+
+          # 3) 解压到临时目录，再覆盖进工作区（zip 里有没有顶层目录都行）
+          if not chosen:
+              print('no project zip found, using repository files as-is')
+          else:
+              print('USING:', chosen)
+              tmp = os.path.join(tempfile.gettempdir(), 'lancast_proj')
+              shutil.rmtree(tmp, ignore_errors=True); os.makedirs(tmp)
+              with zipfile.ZipFile(chosen) as z:
+                  z.extractall(tmp)
+              root = tmp
+              if not is_project_dir(root):
+                  hit = None
+                  for cur, dirs, _ in os.walk(tmp):
+                      if cur[len(tmp):].count(os.sep) > 3: dirs[:] = []; continue
+                      if is_project_dir(cur): hit = cur; break
+                  if hit: root = hit
+              print('project root in zip:', root)
+              shutil.copytree(root, '.', dirs_exist_ok=True)
+
+          need = os.environ.get('NEED_DIR', '')
+          if need and not os.path.isdir(need):
+              print(f'::error::{need}/ directory not found'); sys.exit(1)
+          print('OK, workspace ready')
 
       - uses: actions/setup-java@v4
         with:
@@ -51,8 +93,7 @@ jobs:
       - name: Accept Android licenses
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
-      # Gradle 版本以 android/gradle/wrapper/gradle-wrapper.properties 为唯一来源（AGP 8.13 要求 Gradle >= 8.13）。
-      # 这样升级 AGP/Gradle 时只改一处，不会再出现“工作流写 8.7、项目要 8.13”的错位。
+      # Gradle 版本以 android/gradle/wrapper/gradle-wrapper.properties 为唯一来源（AGP 升级时只改一处）。
       - name: Read Gradle version from wrapper properties
         id: gradlever
         shell: bash
@@ -63,71 +104,219 @@ jobs:
           echo "Gradle version: $ver"
           echo "version=$ver" >> "$GITHUB_OUTPUT"
 
+      # setup-gradle 会自动缓存 Gradle 依赖 / 构建缓存（默认只在默认分支写入缓存，其它分支只读）
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: ${{ steps.gradlever.outputs.version }}
 
       - name: Build debug APK
         working-directory: android
-        run: gradle assembleDebug --no-daemon --stacktrace
+        run: gradle assembleDebug --no-daemon --parallel --build-cache --stacktrace
 
       - uses: actions/upload-artifact@v4
         with:
           name: LANCast-debug-apk
           path: android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+          compression-level: 0        # apk 本身已是压缩包，不再二次压缩，上传更快
 
-  windows-exe:
+  # 测试单独成一个 job，和打包并行跑（测试不需要 Electron，所以不下载它）；测试失败不影响出包
+  windows-tests:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Unpack newest project zip (if any)
-        shell: pwsh
+      # 取仓库里“最近提交”的项目 zip（文件名随便叫什么、放在哪个文件夹都行；里面没有 android/ 或 windows/ 的 zip 会被忽略），
+      # 解压后覆盖进工作区。没有 zip 时，直接用仓库里已经解开的文件。
+      - name: Unpack newest project zip (any file name)
+        shell: python {0}
+        env:
+          PYTHONUTF8: "1"
+          NEED_DIR: windows
         run: |
-          $newest = $null; $newestT = 0
-          foreach ($f in Get-ChildItem -Path . -Filter *.zip -File) {
-            $t = [int64](git log -1 --format=%ct -- $f.Name)
-            Write-Host "found: $($f.Name) (committed at $t)"
-            if ($t -ge $newestT) { $newestT = $t; $newest = $f.FullName }
-          }
-          if (-not $newest) {
-            Write-Host "no zip found, using repository files as-is"
-          } else {
-            Write-Host "USING: $newest"
-            $tmp = Join-Path $env:RUNNER_TEMP "proj"
-            if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
-            Expand-Archive -Path $newest -DestinationPath $tmp -Force
-            $root = $tmp
-            if (-not (Test-Path (Join-Path $root "windows"))) {
-              $hit = Get-ChildItem -Path $tmp -Directory -Recurse -Depth 2 -Filter windows | Select-Object -First 1
-              if ($hit) { $root = $hit.Parent.FullName }
-            }
-            Write-Host "project root in zip: $root"
-            Copy-Item -Path (Join-Path $root "*") -Destination $env:GITHUB_WORKSPACE -Recurse -Force
-          }
-          if (-not (Test-Path windows)) { Write-Error "windows/ directory not found"; exit 1 }
+          import os, shutil, subprocess, sys, tempfile, zipfile
+
+          def git(*a):
+              return subprocess.run(['git', '-c', 'core.quotepath=off', '--literal-pathspecs', *a],
+                                    capture_output=True, text=True, encoding='utf-8', errors='replace')
+
+          def is_project_dir(d):
+              return os.path.isdir(os.path.join(d, 'android')) or os.path.isdir(os.path.join(d, 'windows'))
+
+          # 1) 找出仓库里所有 .zip（任意文件名 / 任意子文件夹；跳过项目自己的目录），按“最近一次提交时间”从新到旧排
+          SKIP = {'.git', 'node_modules', 'android', 'windows', 'docs', 'assets', '.github'}
+          cands = []
+          for root, dirs, files in os.walk('.'):
+              dirs[:] = [d for d in dirs if d not in SKIP]
+              for f in files:
+                  if f.lower().endswith('.zip'):
+                      p = os.path.normpath(os.path.join(root, f)).replace('\\', '/')
+                      out = git('log', '-1', '--format=%ct', '--', p).stdout.strip()
+                      t = int(out) if out.isdigit() else 0
+                      print(f'found: {p} (committed at {t})')
+                      cands.append((t, os.path.getmtime(p), p))
+          cands.sort(reverse=True)
+
+          # 2) 取最新的、且里面确实有 android/ 或 windows/ 目录的那个（不是项目包的 zip 自动忽略）
+          chosen = None
+          for t, _, p in cands:
+              try:
+                  with zipfile.ZipFile(p) as z:
+                      names = ['/' + n.replace('\\', '/') for n in z.namelist()]
+                  if any('/android/' in n or '/windows/' in n for n in names):
+                      chosen = p; break
+                  print(f'skip (not a project zip): {p}')
+              except zipfile.BadZipFile:
+                  print(f'skip (bad zip): {p}')
+
+          # 3) 解压到临时目录，再覆盖进工作区（zip 里有没有顶层目录都行）
+          if not chosen:
+              print('no project zip found, using repository files as-is')
+          else:
+              print('USING:', chosen)
+              tmp = os.path.join(tempfile.gettempdir(), 'lancast_proj')
+              shutil.rmtree(tmp, ignore_errors=True); os.makedirs(tmp)
+              with zipfile.ZipFile(chosen) as z:
+                  z.extractall(tmp)
+              root = tmp
+              if not is_project_dir(root):
+                  hit = None
+                  for cur, dirs, _ in os.walk(tmp):
+                      if cur[len(tmp):].count(os.sep) > 3: dirs[:] = []; continue
+                      if is_project_dir(cur): hit = cur; break
+                  if hit: root = hit
+              print('project root in zip:', root)
+              shutil.copytree(root, '.', dirs_exist_ok=True)
+
+          need = os.environ.get('NEED_DIR', '')
+          if need and not os.path.isdir(need):
+              print(f'::error::{need}/ directory not found'); sys.exit(1)
+          print('OK, workspace ready')
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 20
 
-      - name: Install dependencies
-        working-directory: windows
-        run: npm install --no-audit --no-fund
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\npm-cache
+          key: npm-win-${{ hashFiles('windows/package.json') }}
+          restore-keys: npm-win-
 
-      - name: Build standalone player (folia-major)
+      - name: Install dependencies (skip Electron download)
         working-directory: windows
-        run: node build-player.js
+        run: npm install --no-audit --no-fund --prefer-offline --ignore-scripts
 
       - name: Run tests
         working-directory: windows
         run: npm test
         continue-on-error: true
 
-      - name: Build exe (installer + portable)
+  windows-exe:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 取仓库里“最近提交”的项目 zip（文件名随便叫什么、放在哪个文件夹都行；里面没有 android/ 或 windows/ 的 zip 会被忽略），
+      # 解压后覆盖进工作区。没有 zip 时，直接用仓库里已经解开的文件。
+      - name: Unpack newest project zip (any file name)
+        shell: python {0}
+        env:
+          PYTHONUTF8: "1"
+          NEED_DIR: windows
+        run: |
+          import os, shutil, subprocess, sys, tempfile, zipfile
+
+          def git(*a):
+              return subprocess.run(['git', '-c', 'core.quotepath=off', '--literal-pathspecs', *a],
+                                    capture_output=True, text=True, encoding='utf-8', errors='replace')
+
+          def is_project_dir(d):
+              return os.path.isdir(os.path.join(d, 'android')) or os.path.isdir(os.path.join(d, 'windows'))
+
+          # 1) 找出仓库里所有 .zip（任意文件名 / 任意子文件夹；跳过项目自己的目录），按“最近一次提交时间”从新到旧排
+          SKIP = {'.git', 'node_modules', 'android', 'windows', 'docs', 'assets', '.github'}
+          cands = []
+          for root, dirs, files in os.walk('.'):
+              dirs[:] = [d for d in dirs if d not in SKIP]
+              for f in files:
+                  if f.lower().endswith('.zip'):
+                      p = os.path.normpath(os.path.join(root, f)).replace('\\', '/')
+                      out = git('log', '-1', '--format=%ct', '--', p).stdout.strip()
+                      t = int(out) if out.isdigit() else 0
+                      print(f'found: {p} (committed at {t})')
+                      cands.append((t, os.path.getmtime(p), p))
+          cands.sort(reverse=True)
+
+          # 2) 取最新的、且里面确实有 android/ 或 windows/ 目录的那个（不是项目包的 zip 自动忽略）
+          chosen = None
+          for t, _, p in cands:
+              try:
+                  with zipfile.ZipFile(p) as z:
+                      names = ['/' + n.replace('\\', '/') for n in z.namelist()]
+                  if any('/android/' in n or '/windows/' in n for n in names):
+                      chosen = p; break
+                  print(f'skip (not a project zip): {p}')
+              except zipfile.BadZipFile:
+                  print(f'skip (bad zip): {p}')
+
+          # 3) 解压到临时目录，再覆盖进工作区（zip 里有没有顶层目录都行）
+          if not chosen:
+              print('no project zip found, using repository files as-is')
+          else:
+              print('USING:', chosen)
+              tmp = os.path.join(tempfile.gettempdir(), 'lancast_proj')
+              shutil.rmtree(tmp, ignore_errors=True); os.makedirs(tmp)
+              with zipfile.ZipFile(chosen) as z:
+                  z.extractall(tmp)
+              root = tmp
+              if not is_project_dir(root):
+                  hit = None
+                  for cur, dirs, _ in os.walk(tmp):
+                      if cur[len(tmp):].count(os.sep) > 3: dirs[:] = []; continue
+                      if is_project_dir(cur): hit = cur; break
+                  if hit: root = hit
+              print('project root in zip:', root)
+              shutil.copytree(root, '.', dirs_exist_ok=True)
+
+          need = os.environ.get('NEED_DIR', '')
+          if need and not os.path.isdir(need):
+              print(f'::error::{need}/ directory not found'); sys.exit(1)
+          print('OK, workspace ready')
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\npm-cache
+          key: npm-win-${{ hashFiles('windows/package.json') }}
+          restore-keys: npm-win-
+
+      # Electron 二进制、NSIS、winCodeSign 等每次都要从 GitHub 下载，缓存后基本省掉这段时间
+      - name: Cache Electron / electron-builder downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\electron\Cache
+            ~\AppData\Local\electron-builder\Cache
+          key: electron-win-${{ hashFiles('windows/package.json') }}
+          restore-keys: electron-win-
+
+      - name: Install dependencies
+        working-directory: windows
+        run: npm install --no-audit --no-fund --prefer-offline
+
+      - name: Build exe (installer only)
         working-directory: windows
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
@@ -138,3 +327,5 @@ jobs:
           name: LANCast-windows-exe
           path: |
             windows/dist/*.exe
+          if-no-files-found: error
+          compression-level: 0        # exe 已经压缩过，不再二次压缩，上传更快
