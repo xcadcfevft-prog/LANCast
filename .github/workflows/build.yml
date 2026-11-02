@@ -117,8 +117,7 @@ jobs:
         with:
           name: LANCast-debug-apk
           path: android/app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
-          compression-level: 0        # apk 本身已是压缩包，不再二次压缩，上传更快
+          if-no-files-found: error    # apk 里有不少未压缩内容，保持默认压缩，artifact 约小一半，手机下载更快
 
   # 测试单独成一个 job，和打包并行跑（测试不需要 Electron，所以不下载它）；测试失败不影响出包
   windows-tests:
